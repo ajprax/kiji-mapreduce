@@ -22,9 +22,12 @@ package org.kiji.mapreduce.framework;
 import java.io.Closeable;
 import java.io.IOException;
 import java.util.Iterator;
+import java.util.Map;
 import java.util.NavigableMap;
 
+import com.google.common.collect.Maps;
 import org.apache.commons.io.output.ByteArrayOutputStream;
+import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.mapreduce.Counter;
 import org.apache.hadoop.mapreduce.Counters;
 import org.apache.hadoop.mapreduce.Job;
@@ -32,6 +35,7 @@ import org.apache.hadoop.mapreduce.Job;
 import org.kiji.annotations.ApiAudience;
 import org.kiji.annotations.ApiStability;
 import org.kiji.mapreduce.avro.generated.JobHistoryEntry;
+import org.kiji.schema.AtomicKijiPutter;
 import org.kiji.schema.EntityId;
 import org.kiji.schema.Kiji;
 import org.kiji.schema.KijiDataRequest;
@@ -40,7 +44,6 @@ import org.kiji.schema.KijiRowData;
 import org.kiji.schema.KijiRowScanner;
 import org.kiji.schema.KijiTable;
 import org.kiji.schema.KijiTableReader;
-import org.kiji.schema.KijiTableWriter;
 import org.kiji.schema.layout.KijiTableLayout;
 import org.kiji.schema.util.ResourceUtils;
 
@@ -66,6 +69,8 @@ public final class JobHistoryKijiTable implements Closeable {
   public static final String JOB_HISTORY_FAMILY = "info";
   /** Column family for job counters. */
   public static final String JOB_HISTORY_COUNTERS_FAMILY = "counters";
+  /** Column family where extended information is stored. */
+  public static final String JOB_HISTORY_EXTENDED_INFO_FAMILY = "extendedInfo";
   /** Qualifier where job IDs are stored. */
   public static final String JOB_HISTORY_ID_QUALIFIER = "jobId";
   /** Qualifier where job names are stored. */
@@ -80,6 +85,8 @@ public final class JobHistoryKijiTable implements Closeable {
   public static final String JOB_HISTORY_COUNTERS_QUALIFIER = "counters";
   /** Qualifier where job configurations are stored. */
   public static final String JOB_HISTORY_CONFIGURATION_QUALIFIER = "configuration";
+  /** Value stored to configuration qualifier if the job did not have a configuration. */
+  public static final String JOB_HISTORY_NO_CONFIGURATION_VALUE = "No configuration for job.";
 
   /** The HBaseKijiTable managed by the JobHistoryKijiTable. */
   private final KijiTable mKijiTable;
@@ -121,21 +128,65 @@ public final class JobHistoryKijiTable implements Closeable {
   /**
    * Helper method to write individual counters to job history table's counter family.
    *
-   * @param writer The {@link KijiTableWriter} for the job history table.
+   * @param putter The {@link org.kiji.schema.AtomicKijiPutter} for the job history table.
+   * @param startTime time in milliseconds since the epoch at which the job started.
    * @param job The {@link Job} whose counters we are recording.
    * @throws IOException If there is an error writing to the table.
    */
-  private void writeIndividualCounters(KijiTableWriter writer, Job job) throws IOException {
-    EntityId jobEntity = mKijiTable.getEntityId(job.getJobID().toString());
-    Counters counters = job.getCounters();
+  private void writeIndividualCounters(
+      final AtomicKijiPutter putter,
+      final long startTime,
+      final Job job
+  ) throws IOException {
+    final Counters counters = job.getCounters();
+    final Map<String, Long> counterMap = Maps.newHashMap();
     for (String grpName: counters.getGroupNames()) {
       Iterator<Counter> counterIterator = counters.getGroup(grpName).iterator();
       while (counterIterator.hasNext()) {
         Counter ctr = counterIterator.next();
-        writer.put(jobEntity, JOB_HISTORY_COUNTERS_FAMILY, grpName + ":" + ctr.getName(),
-            ctr.getValue());
+        counterMap.put(String.format("%s:%s", grpName, ctr.getName()), ctr.getValue());
       }
     }
+    writeIndividualCounters(putter, startTime, counterMap);
+  }
+
+  /**
+   * Add counters to an outstanding atomic transaction on the given atomic putter.
+   *
+   * @param putter atomic putter with an open transaction.
+   * @param startTime time in milliseconds since the epoch at which the job started.
+   * @param counters map of counters from the job. Keys should be of the form 'group:name'.
+   * @throws IOException in case of an error adding the counters to the transaction.
+   */
+  private void writeIndividualCounters(
+      final AtomicKijiPutter putter,
+      final long startTime,
+      final Map<String, Long> counters
+  ) throws IOException {
+    for (Map.Entry<String, Long> counterEntry : counters.entrySet()) {
+      putter.put(JOB_HISTORY_COUNTERS_FAMILY, counterEntry.getKey(), startTime,
+          counterEntry.getValue());
+    }
+  }
+
+  /**
+   * Add extended information to an outstanding atomic transaction on the given atomic putter.
+   *
+   * @param putter atomic putter with an open transaction.
+   * @param startTime time in milliseconds since the epoch at which the job started.
+   * @param extendedInfo map of additional information about the job.
+   * @throws IOException in case of an error adding the extended info to the transaction.
+   */
+  private void writeExtendedInfo(
+      final AtomicKijiPutter putter,
+      final long startTime,
+      final Map<String, String> extendedInfo
+  ) throws IOException {
+    for (Map.Entry<String, String> infoEntry : extendedInfo.entrySet()) {
+      putter.put(JOB_HISTORY_EXTENDED_INFO_FAMILY, infoEntry.getKey(), startTime,
+          infoEntry.getValue());
+    }
+
   }
 
   /**
@@ -146,29 +197,85 @@ public final class JobHistoryKijiTable implements Closeable {
    * @param endTime The time the job ended, in milliseconds
    * @throws IOException If there is an error writing to the table.
    */
-  public void recordJob(Job job, long startTime, long endTime) throws IOException {
-    KijiTableWriter writer = mKijiTable.openTableWriter();
-    EntityId jobEntity = mKijiTable.getEntityId(job.getJobID().toString());
+  public void recordJob(
+      final Job job,
+      final long startTime,
+      final long endTime
+  ) throws IOException {
+    final EntityId jobEntity = mKijiTable.getEntityId(job.getJobID().toString());
+    final AtomicKijiPutter putter = mKijiTable.getWriterFactory().openAtomicPutter();
     try {
-      ByteArrayOutputStream baos = new ByteArrayOutputStream();
-      writer.put(jobEntity, JOB_HISTORY_FAMILY, JOB_HISTORY_ID_QUALIFIER,
-          startTime, job.getJobID().toString());
-      writer.put(jobEntity, JOB_HISTORY_FAMILY, JOB_HISTORY_NAME_QUALIFIER,
-          startTime, job.getJobName());
-      writer.put(jobEntity, JOB_HISTORY_FAMILY, JOB_HISTORY_START_TIME_QUALIFIER,
-          startTime, startTime);
-      writer.put(jobEntity, JOB_HISTORY_FAMILY, JOB_HISTORY_END_TIME_QUALIFIER,
-          startTime, endTime);
-      writer.put(jobEntity, JOB_HISTORY_FAMILY, JOB_HISTORY_END_STATUS_QUALIFIER,
-          startTime, job.isSuccessful() ? "SUCCEEDED" : "FAILED");
-      writer.put(jobEntity, JOB_HISTORY_FAMILY, JOB_HISTORY_COUNTERS_QUALIFIER,
-          startTime, job.getCounters().toString());
+      putter.begin(jobEntity);
+      putter.put(JOB_HISTORY_FAMILY, JOB_HISTORY_ID_QUALIFIER, startTime,
+          job.getJobID().toString());
+      putter.put(JOB_HISTORY_FAMILY, JOB_HISTORY_NAME_QUALIFIER, startTime, job.getJobName());
+      putter.put(JOB_HISTORY_FAMILY, JOB_HISTORY_START_TIME_QUALIFIER, startTime, startTime);
+      putter.put(JOB_HISTORY_FAMILY, JOB_HISTORY_END_TIME_QUALIFIER, startTime, endTime);
+      putter.put(JOB_HISTORY_FAMILY, JOB_HISTORY_END_STATUS_QUALIFIER, startTime,
+          job.isSuccessful() ? "SUCCEEDED" : "FAILED");
+      putter.put(JOB_HISTORY_FAMILY, JOB_HISTORY_COUNTERS_QUALIFIER, startTime,
+          job.getCounters().toString());
+      final ByteArrayOutputStream baos = new ByteArrayOutputStream();
       job.getConfiguration().writeXml(baos);
-      writer.put(jobEntity, JOB_HISTORY_FAMILY, JOB_HISTORY_CONFIGURATION_QUALIFIER,
+      putter.put(JOB_HISTORY_FAMILY, JOB_HISTORY_CONFIGURATION_QUALIFIER,
           startTime, baos.toString("UTF-8"));
-      writeIndividualCounters(writer, job);
+      writeIndividualCounters(putter, startTime, job);
     } finally {
-      ResourceUtils.closeOrLog(writer);
+      putter.close();
+    }
+  }
+
+  /**
+   * Writes details of a job into the JobHistoryKijiTable.
+   *
+   * @param jobId unique identifier for the job.
+   * @param jobName name of the job.
+   * @param startTime time in milliseconds since the epoch at which the job started.
+   * @param endTime time in milliseconds since the epoch at which the job ended.
+   * @param jobSuccess whether the job completed successfully.
+   * @param counters map of counters from the job. Keys should be of the form 'group:name'.
+   * @param conf Configuration of the job.
+   * @param extendedInfo any additional information which should be stored about the job.
+   * @throws IOException in case of an error writing to the table.
+   */
+  // CSOFF: ParameterNumberCheck
+  public void recordJob(
+      final String jobId,
+      final String jobName,
+      final long startTime,
+      final long endTime,
+      final boolean jobSuccess,
+      final Configuration conf,
+      final Map<String, Long> counters,
+      final Map<String, String> extendedInfo
+  ) throws IOException {
+    // CSON: ParameterNumberCheck
+    final EntityId eid = mKijiTable.getEntityId(jobId);
+    final AtomicKijiPutter writer = mKijiTable.getWriterFactory().openAtomicPutter();
+    try {
+      writer.begin(eid);
+      writer.put(JOB_HISTORY_FAMILY, JOB_HISTORY_ID_QUALIFIER, startTime, jobId);
+      writer.put(JOB_HISTORY_FAMILY, JOB_HISTORY_NAME_QUALIFIER, startTime, jobName);
+      writer.put(JOB_HISTORY_FAMILY, JOB_HISTORY_START_TIME_QUALIFIER, startTime, startTime);
+      writer.put(JOB_HISTORY_FAMILY, JOB_HISTORY_END_TIME_QUALIFIER, startTime, endTime);
+      writer.put(JOB_HISTORY_FAMILY, JOB_HISTORY_END_STATUS_QUALIFIER, startTime,
+          (jobSuccess) ? "SUCCEEDED" : "FAILED");
+      writer.put(JOB_HISTORY_FAMILY, JOB_HISTORY_COUNTERS_QUALIFIER, startTime,
+          counters.toString());
+      if (null != conf) {
+        final ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        conf.writeXml(baos);
+        writer.put(JOB_HISTORY_FAMILY, JOB_HISTORY_CONFIGURATION_QUALIFIER, startTime,
+            baos.toString("UTF-8"));
+      } else {
+        writer.put(JOB_HISTORY_FAMILY, JOB_HISTORY_CONFIGURATION_QUALIFIER, startTime,
+            JOB_HISTORY_NO_CONFIGURATION_VALUE);
+      }
+      writeIndividualCounters(writer, startTime, counters);
+      writeExtendedInfo(writer, startTime, extendedInfo);
+      writer.commit();
+    } finally {
+      writer.close();
     }
   }
 
